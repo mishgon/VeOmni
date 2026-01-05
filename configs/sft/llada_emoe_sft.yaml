@@ -1,0 +1,53 @@
+model:
+  config_path: ./configs/model_configs/llada_emoe
+  model_path: ../LLaDA-MoE-7B-A1B-Base
+  tokenizer_path: ../LLaDA-MoE-7B-A1B-Base
+  attn_implementation: sdpa
+
+data:
+  train_path: ../data/gsm8k/train.jsonl
+  test_path: ../data/gsm8k/test.jsonl
+  data_type: conversation
+  dataloader_type: native
+  datasets_type: mapping
+  max_seq_len: 512
+  num_workers: 16
+
+train:
+  output_dir: ../llada_emoe_sft_outputs
+  data_parallel_mode: fsdp2
+  tensor_parallel_size: 1
+  ulysses_parallel_size: 1
+  expert_parallel_size: 1
+  global_batch_size: 256
+  micro_batch_size: 64
+  num_train_epochs: 100
+  rmpad: false
+  rmpad_with_pos_ids: false
+  bsz_warmup_ratio: 0.007
+  dyn_bsz_margin: 0
+  dyn_bsz_buffer_size: 200
+  optimizer: adamw
+  lr: 1.0e-5
+  lr_warmup_ratio: 0.03
+  lr_decay_style: cosine
+  lr_decay_ratio: 1.0
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  enable_fsdp_offload: false
+  enable_activation_offload: false
+  init_device: meta
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  ckpt_manager: dcp
+  load_checkpoint_path: ""
+  save_epochs: 100
+  save_hf_weights: true
+  # block_diffusion_mode: true
+  # block_size: 32
+  # same_token_labels: true
+  use_wandb: false  # or you can set `wandb_project` and `wandb_name` to trace your training
+  use_tensorboard: true
