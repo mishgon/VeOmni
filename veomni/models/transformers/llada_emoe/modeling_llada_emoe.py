@@ -673,7 +673,7 @@ class LLaDAEMoESparseEMoEBlock(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = False
         self.gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
-        self.new_gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
+        self.posterior_gate = nn.Linear(config.hidden_size, self.num_experts, bias=False)
         self.experts = nn.ModuleList([LLaDAEMoEMLP(config, 'expert') for _ in range(self.num_experts)])
 
     def forward(
@@ -682,33 +682,32 @@ class LLaDAEMoESparseEMoEBlock(nn.Module):
             full_hidden_states: Optional[torch.Tensor] = None,
             tau: float = 0.5
     ) -> LLaDAEMoESparseEMoEBlockOutput:
-        device = hidden_states.device
+        dtype, device = hidden_states.dtype, hidden_states.device
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        old_router_logits = self.gate(hidden_states)
-        prior_router_logits = self.new_gate(hidden_states)
+
+        prior_router_logits = self.gate(hidden_states)
         if full_hidden_states is None:
             posterior_router_logits = None
-            new_router_logits = prior_router_logits
+            router_logits = prior_router_logits
         else:
             assert full_hidden_states.shape == (batch_size, sequence_length, hidden_dim)
             full_hidden_states = full_hidden_states.view(-1, hidden_dim)
-            posterior_router_logits = self.new_gate(full_hidden_states)
-            new_router_logits = posterior_router_logits
+            posterior_router_logits = prior_router_logits + self.posterior_gate(full_hidden_states - hidden_states)
+            router_logits = posterior_router_logits
 
-        routing_weights = F.softmax(old_router_logits, dim=1, dtype=torch.float)
-
-        new_router_logits = new_router_logits.float()
-        gumbel_noise = -torch.empty_like(new_router_logits, memory_format=torch.legacy_contiguous_format).exponential_().log()
-        gumbel_logits = (new_router_logits + gumbel_noise) / tau  # (batch_size * seq_len, num_experts)
+        router_logits = router_logits.float()
+        gumbel_noise = -torch.empty_like(router_logits, memory_format=torch.legacy_contiguous_format).exponential_().log()
+        gumbel_logits = router_logits + gumbel_noise  # (batch_size * seq_len, num_experts)
         _, selected_experts = torch.topk(gumbel_logits, self.top_k, dim=-1)  # (batch_size * seq_len, top_k)
+
+        routing_weights = F.softmax(prior_router_logits, dim=-1, dtype=torch.float)
         routing_weights = routing_weights.gather(dim=-1, index=selected_experts)
         if self.norm_topk_prob:
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-
         hard_gumbel_weights = torch.ones((batch_size * sequence_length, self.top_k), dtype=torch.float, device=device)
         for i in range(self.top_k):
-            gumbel_softmax = F.softmax(gumbel_logits, dim=-1)
+            gumbel_softmax = F.softmax(gumbel_logits / tau, dim=-1)
             soft_gumbel_weights = gumbel_softmax.gather(dim=-1, index=selected_experts)
             soft_gumbel_weights /= soft_gumbel_weights.sum(dim=-1, keepdim=True)
             hard_gumbel_weights = hard_gumbel_weights - soft_gumbel_weights.detach() + soft_gumbel_weights
@@ -754,8 +753,7 @@ class LLaDAEMoESparseEMoEBlock(nn.Module):
         if full_hidden_states is not None:
             log_prior = torch.log_softmax(prior_router_logits, dim=-1)
             log_posterior = torch.log_softmax(posterior_router_logits, dim=-1)
-            posterior = torch.softmax(posterior_router_logits, dim=-1)
-            kl_loss = torch.sum(posterior * (log_posterior - log_prior), dim=-1)
+            kl_loss = self._kl_loss(log_posterior, log_prior)
             kl_loss = kl_loss.view(batch_size, sequence_length)
 
         return LLaDAEMoESparseEMoEBlockOutput(
@@ -763,6 +761,80 @@ class LLaDAEMoESparseEMoEBlock(nn.Module):
             full_hidden_states=final_full_hidden_states,
             kl_loss=kl_loss
         )
+
+    def _kl_loss(self, log_posterior: torch.Tensor, log_prior: torch.Tensor) -> torch.Tensor:
+        log_a = log_posterior.float()
+        log_b = log_prior.float()
+        B, N = log_a.shape
+        assert log_b.shape == (B, N)
+        K = self.top_k
+
+        pref_a = self._log_esps_prefix(log_a)            # (B, N + 1, K + 1)
+        suff_a = self._log_esps_suffix(log_a)            # (B, N + 1, K + 1)
+        logZ_a = pref_a[:, N, K]                         # (B,)
+
+        # compute log Z(alpha_{-i}) vectorized
+        pref_slice = pref_a[:, :N, :K]                   # (B, N, K)
+        suff_slice = suff_a[:, 1:, :K]                   # (B, N, K)
+        suff_rev = torch.flip(suff_slice, dims=[2])      # (B, N, K)
+        joint = pref_slice + suff_rev                    # (B, N, K)
+        logZ_excl = torch.logsumexp(joint, dim=2)        # (B, N)
+
+        log_m = log_a + logZ_excl - logZ_a.unsqueeze(1)  # (B, N)
+        m = torch.exp(log_m)                             # (B, N)
+
+        err = (m.sum(dim=1) - K).abs().max()
+        assert err < 1e-2, f"Error in KL loss computation: {err}"
+
+        pref_b = self._log_esps_prefix(log_b)            # (B, N + 1, K + 1)
+        logZ_b = pref_b[:, N, K]                         # (B,)
+
+        kl_loss = torch.sum(m * (log_a - log_b), dim=1) + logZ_b - logZ_a    # (B,)
+        kl_loss = kl_loss.to(log_posterior.dtype)
+        return kl_loss
+
+    def _log_esps_prefix(self, log_probs: torch.Tensor) -> torch.Tensor:
+        r"""
+        .. math::
+            pref[n, k] = \log \sum_{S \subseteq \{1, \ldots, n\}: |S| = k} \exp \sum_{i \in S} \log p_i
+        """
+        B, N = log_probs.shape
+        K = self.top_k
+        pref = torch.full((B, N + 1, K + 1), float('-inf'), device=log_probs.device, dtype=log_probs.dtype)
+        pref[:, :, 0] = 0.0
+        for n in range(1, N + 1):
+            log_prob_n = log_probs[:, n - 1].unsqueeze(1)
+            pref[:, n, 1:] = self._safe_logaddexp(pref[:, n - 1, 1:], log_prob_n + pref[:, n - 1, :K])
+        return pref
+
+    def _log_esps_suffix(self, log_probs: torch.Tensor) -> torch.Tensor:
+        r"""
+        .. math::
+            suff[n, k] = \log \sum_{S \subseteq \{n + 1, ..., N\}: |S| = k} \exp \sum_{i \in S} \log p_i
+        """
+        B, N = log_probs.shape
+        K = self.top_k
+        suff = torch.full((B, N + 1, K + 1), float('-inf'), device=log_probs.device, dtype=log_probs.dtype)
+        suff[:, :, 0] = 0.0
+        for n in range(N - 1, -1, -1):
+            log_prob_np1 = log_probs[:, n].unsqueeze(1)
+            suff[:, n, 1:] = self._safe_logaddexp(suff[:, n + 1, 1:], log_prob_np1 + suff[:, n + 1, :K])
+        return suff
+
+    @staticmethod
+    def _safe_logaddexp(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        # mask where both are -inf
+        both_neg_inf = torch.isneginf(a) & torch.isneginf(b)
+        if not both_neg_inf.any():
+            return torch.logaddexp(a, b)
+
+        # create finite replacement (same dtype/device)
+        safe_a = torch.where(both_neg_inf, 0, a)
+        safe_b = torch.where(both_neg_inf, 0, b)
+        out = torch.logaddexp(safe_a, safe_b)
+        # restore -inf for exact forward semantics
+        out = torch.where(both_neg_inf, torch.full_like(out, float("-inf")), out)
+        return out
 
 
 @dataclass
@@ -876,7 +948,7 @@ class LLaDAEMoEPreTrainedModel(PreTrainedModel):
 
 
 @dataclass
-class LLaDAEMoEModelOutput:
+class LLaDAEMoEModelOutput(ModelOutput):
     last_hidden_state: Optional[torch.FloatTensor] = None
     hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
     kl_losses: Optional[tuple[torch.FloatTensor, ...]] = None
@@ -898,8 +970,6 @@ class LLaDAEMoEModel(LLaDAEMoEPreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
-        for layer in self.layers:
-            layer.mlp.new_gate.weight.data.zero_()
 
     def get_input_embeddings(self):
         return self.embed_tokens

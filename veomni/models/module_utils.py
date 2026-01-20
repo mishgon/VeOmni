@@ -460,6 +460,10 @@ def post_process_after_weight_loading(
             logger.info_rank0(f"Failed to tie embeddings: {e}")
             raise RuntimeError("Failed to tie input/output embeddings") from e
 
+    for layer_idx, layer in enumerate(model.model.layers):
+        logger.info_rank0(f"Initializing gate_1 and gate_2 of layer {layer_idx}")
+        layer.mlp.posterior_gate.weight.data.zero_()
+
 
 def _get_shard_info(
     state_dict: Dict[str, "torch.Tensor"],

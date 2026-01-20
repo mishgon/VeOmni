@@ -19,9 +19,9 @@ train:
   tensor_parallel_size: 1
   ulysses_parallel_size: 1
   expert_parallel_size: 1
-  global_batch_size: 256
-  micro_batch_size: 64
-  num_train_epochs: 100
+  global_batch_size: 512
+  micro_batch_size: 128
+  num_train_epochs: 1000
   rmpad: false
   rmpad_with_pos_ids: false
   bsz_warmup_ratio: 0.007
@@ -44,7 +44,7 @@ train:
   empty_cache_steps: 500
   ckpt_manager: dcp
   load_checkpoint_path: ""
-  save_epochs: 100
+  save_epochs: 250
   save_hf_weights: true
   # block_diffusion_mode: true
   # block_size: 32

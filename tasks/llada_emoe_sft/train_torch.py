@@ -316,6 +316,22 @@ def main():
         enable_forward_prefetch=args.train.enable_forward_prefetch,
     )
 
+    def needs_high_lr(name: str) -> bool:
+        return "posterior_gate" in name
+
+    param_groups = [
+        {
+            "params": [p for n, p in model.named_parameters() if needs_high_lr(n)],
+            "lr": 1e-3,
+            "weight_decay": 0.0,
+        },
+        {
+            "params": [p for n, p in model.named_parameters() if not needs_high_lr(n) and p.requires_grad],
+            "lr": args.train.lr,
+            "weight_decay": args.train.weight_decay,
+        },
+    ]
+
     optimizer = build_optimizer(
         model,
         lr=args.train.lr,
@@ -323,6 +339,7 @@ def main():
         weight_decay=args.train.weight_decay,
         fused=True,
         optimizer_type=args.train.optimizer,
+        param_groups=param_groups,
     )
     if get_optimizer_pre_hook is not None:
         optimizer_pre_hook = get_optimizer_pre_hook(model, model_config, args.train.data_parallel_mode)

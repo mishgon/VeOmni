@@ -451,7 +451,7 @@ def main():
             if global_step == 1:
                 helper.print_example(example=micro_batches[0], rank=args.train.local_rank)
 
-            total_loss = 0
+            total_loss = total_err = 0
             synchronize()
             start_time = time.time()
             for micro_batch in micro_batches:
@@ -498,6 +498,8 @@ def main():
                     loss = loss.sum(dim=1) / ((labels != IGNORE_INDEX).sum(dim=1) + 1e-6)  # should be scaling by 1 / (mask_prob * seq_len), but this is similar
                     loss = loss.mean()  # average over batch
                     loss = loss / len(micro_batches)  # as we sum up losses for multiple micro_batches
+
+                    err = torch.mean((logits.argmax(dim=-1) != labels)[labels != IGNORE_INDEX].float())
                     # else:
                     #     shifted_logits = logits[:, :-1, :].contiguous()
                     #     shifted_labels = labels[:, 1:].contiguous()
@@ -512,6 +514,7 @@ def main():
                     loss.backward()
 
                 total_loss += loss.item()
+                total_err += err.item()
                 del micro_batch
 
             grad_norm = veomni_clip_grad_norm(model, args.train.max_grad_norm)
@@ -523,23 +526,24 @@ def main():
                 grad_norm = grad_norm.full_tensor().item()
 
             # collect mean loss across data parallel group
-            total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=get_parallel_state().fsdp_group)
+            total_loss, total_err, grad_norm = all_reduce((total_loss, total_err, grad_norm), group=get_parallel_state().fsdp_group)
             synchronize()
             delta_time = time.time() - start_time
             lr = max(lr_scheduler.get_last_lr())
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
-            data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
+            data_loader_tqdm.set_postfix_str(f"loss: {total_loss:.2f}, err: {total_err:.2f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}")
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:
                 if args.train.use_wandb:
                     train_metrics.update(
-                        {"training/loss": total_loss, "training/grad_norm": grad_norm, "training/lr": lr}
+                        {"training/loss": total_loss, "training/err": total_err, "training/grad_norm": grad_norm, "training/lr": lr}
                     )
                     wandb.log(train_metrics, step=global_step)
                 if args.train.use_tensorboard:
                     tb_logger.add_scalar("training/loss", total_loss, global_step)
+                    tb_logger.add_scalar("training/err", total_err, global_step)
                     tb_logger.add_scalar("training/grad_norm", grad_norm, global_step)
                     tb_logger.add_scalar("training/lr", lr, global_step)
                     for tag, scalar_value in train_metrics.items():
@@ -619,7 +623,7 @@ def main():
             disable=args.train.local_rank != 0,
         )
         data_iterator = iter(train_dataloader)
-        total_loss = 0
+        total_loss = total_err = 0
         for _ in range(args.train.test_steps):
             try:
                 micro_batches: List[Dict[str, Any]] = next(data_iterator)
@@ -669,6 +673,8 @@ def main():
                     loss = loss.sum(dim=1) / ((labels != IGNORE_INDEX).sum(dim=1) + 1e-6)  # should be scaling by 1 / (mask_prob * seq_len), but this is similar
                     loss = loss.mean()  # average over batch
                     loss = loss / len(micro_batches) / args.train.test_steps
+
+                    err = torch.mean((logits.argmax(dim=-1) != labels)[labels != IGNORE_INDEX].float())
                     # else:
                     #     shifted_logits = logits[:, :-1, :].contiguous()
                     #     shifted_labels = labels[:, 1:].contiguous()
@@ -680,19 +686,21 @@ def main():
                     #     loss = unscaled_loss.sum() / (shifted_labels != -100).sum() / len(micro_batches)
 
                 total_loss += loss.item()
+                total_err += err.item()
                 del micro_batch
 
             # collect mean loss across data parallel group
-            total_loss = all_reduce(total_loss, group=get_parallel_state().fsdp_group)
+            total_loss, total_err = all_reduce((total_loss, total_err), group=get_parallel_state().fsdp_group)
 
         if args.train.global_rank == 0:
             if args.train.use_wandb:
                 train_metrics.update(
-                    {"test/loss": total_loss}
+                    {"test/loss": total_loss, "test/err": total_err}
                 )
                 wandb.log(train_metrics, step=global_step)
             if args.train.use_tensorboard:
                 tb_logger.add_scalar("test/loss", total_loss, global_step)
+                tb_logger.add_scalar("test/err", total_err, global_step)
                 for tag, scalar_value in train_metrics.items():
                     tb_logger.add_scalar(tag, scalar_value, global_step)
 
